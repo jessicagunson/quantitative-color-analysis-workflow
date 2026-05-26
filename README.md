@@ -13,7 +13,7 @@ quantitative-color-analysis-workflow/
 │
 ├── data/
 │   ├── pixelvalues/
-│   └── toy_behavior_data.csv
+│   └── behavior_data.csv
 │
 ├── output/
 │   ├── color_metrics.csv
@@ -22,8 +22,8 @@ quantitative-color-analysis-workflow/
 ├── scripts/
 │   ├── simulate_color_data.R
 │   ├── simulate_behavior_data.R
-│   ├── color-data-wrangling-workflow.Rmd
-│   └── longitudinal-behavior-modeling.Rmd
+│   ├── color_data_wrangling_workflow.Rmd
+│   └── longitudinal_behavior_modeling.Rmd
 │
 ├── quantitative-color-analysis-workflow.Rproj
 └── README.md
