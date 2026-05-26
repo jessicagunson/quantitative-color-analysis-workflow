@@ -1,0 +1,532 @@
+---
+title: "Image-Derived Color Data Wrangling in R"
+output: html_document
+---
+## Overview
+
+This repository demonstrates a reproducible workflow for processing and analyzing image-derived biological color data in R. The project includes simulated pixel-level datasets modeled after ImageJ exports and illustrates approaches for metadata parsing, channel integration, quantitative color metric calculation, and longitudinal data wrangling.
+
+The workflow emphasizes reproducible analytical practices, including:
+- structured project organization,
+- automated file parsing,
+- pixel-level data processing,
+- feature engineering,
+- and quantitative visualization.
+
+Although inspired by biological signaling research, the methods demonstrated here are broadly applicable to image-based quantitative data analysis workflows.
+
+Peak-red and peak-blue subsets represent localized regions with high RG or BY opponency values, respectively.
+
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+set.seed(123)
+```
+
+
+## Packages
+
+```{r packages}
+if (!require("pacman")) install.packages("pacman")
+
+pacman::p_load(
+  tidyverse,
+  patchwork,
+  here,
+  data.table,
+  knitr
+)
+```
+
+
+## Helpers
+
+```{r helpers}
+normalize_name <- function(x) {
+  x %>%
+    as.character() %>%
+    trimws() %>%
+    tolower() %>%
+    gsub("[[:space:]]+", "", .)
+}
+
+make_roi_id <- function(name, date, region) {
+  paste(normalize_name(name), date, region, sep = "_")
+}
+```
+
+
+# Color Data Wrangling
+## File Parsing
+
+Image-derived pixel files are automatically parsed to extract metadata, including channel identity, individual ID, collection date, and region of interest. The workflow expects ImageJ-style CSV exports containing X/Y pixel coordinates and channel-specific LMS values.
+
+```{r file-parsing}
+data.table::setDTthreads(1)
+options(datatable.optimize = 1)
+
+dir_in <- here("data", "pixelvalues")
+out_path <- here("output", "color_metrics.csv")
+
+dir.create(here("output"), recursive = TRUE, showWarnings = FALSE)
+
+if (!dir.exists(dir_in)) {
+  stop("Input directory not found: ", dir_in)
+}
+
+files <- list.files(dir_in, pattern = "(?i)\\.csv$", full.names = TRUE)
+if (length(files) == 0) stop("No CSV files found in: ", dir_in)
+
+file_info <- data.table(
+  file = files,
+  base = basename(files)
+)
+```
+
+
+## Metadata Extraction and Validation
+
+File names are parsed to identify channel-specific image exports and reconstruct region-of-interest identifiers. The workflow also checks whether each region has complete long-, medium-, and short-wavelength channel data before pixel-level processing.
+
+```{r metadata-extraction}
+file_info[, stem := sub("\\.[Cc][Ss][Vv]$", "", base)]
+file_info[, chan_raw := str_extract(stem, "(?<=_)(lw|mw|sw)(?=_)")]
+file_info[, chan := substr(chan_raw, 1, 1)]
+
+if (anyNA(file_info$chan)) {
+  bad <- file_info[is.na(chan), base]
+  stop(
+    "Couldn't detect lw/mw/sw channel token for some files. Examples:\n",
+    paste(head(bad, 20), collapse = "\n")
+  )
+}
+
+file_info[, roi_core := sub("_(lw|mw|sw)_", "_", stem)]
+
+file_info %>%
+  as_tibble() %>%
+  select(base, chan_raw, chan, roi_core) %>%
+  slice_head(n = 6) %>%
+  knitr::kable(
+    caption = "Example parsed file metadata"
+  )
+roi_core_info <- file_info[
+  ,
+  .(
+    n_chans = uniqueN(chan),
+    chans_present = paste(sort(unique(chan)), collapse = ",")
+  ),
+  by = roi_core
+]
+
+roi_core_info[
+  ,
+  date := str_extract(roi_core, "[0-9]{8}(?=_IMG)")
+]
+
+roi_core_info[
+  ,
+  `:=`(
+    name = str_extract(roi_core, paste0("^.*?(?=", date, ")")),
+    region = tolower(gsub("[0-9]+$", "", sub("^.*_", "", roi_core)))
+  )
+]
+
+roi_core_info[
+  ,
+  period := case_when(
+    date == "20230115" ~ "1",
+    date == "20230302" ~ "2",
+    date == "20230510" ~ "3",
+    date == "20230718" ~ "4",
+    date == "20230925" ~ "5",
+    TRUE ~ NA_character_
+  )
+]
+
+bad_parse <- roi_core_info[
+  is.na(name) | is.na(date) | is.na(region) | is.na(period) |
+    date == "" | region == "",
+  roi_core
+]
+
+if (length(bad_parse) > 0) {
+  stop(
+    "Couldn't parse name/date/region/period for some roi_core values. Examples:\n",
+    paste(head(bad_parse, 20), collapse = "\n")
+  )
+}
+
+roi_core_info[, photo_id := sub("_[^_]+[0-9]+$", "", roi_core)]
+roi_core_info[, male_id := normalize_name(name)]
+roi_core_info[, id_main := make_roi_id(name, date, region)]
+roi_core_info[, has_all_channels := n_chans == 3L]
+```
+
+
+## Image Summary and Channel Completeness
+
+This section summarizes the number of photographs represented in the dataset and identifies regions of interest with complete long-, medium-, and short-wavelength channel data. Only complete regions are passed to the pixel-level processing workflow.
+
+```{r image-summary-channel-completeness}
+image_summary_df <- unique(roi_core_info[, .(male_id, photo_id)])
+
+total_photos <- uniqueN(image_summary_df$photo_id)
+
+photos_per_male <- image_summary_df[
+  ,
+  .(n_photos = .N),
+  by = male_id
+][order(male_id)]
+
+photo_summary_stats <- photos_per_male[
+  ,
+  .(
+    n_males = .N,
+    mean_photos = mean(n_photos),
+    sd_photos = sd(n_photos),
+    min_photos = min(n_photos),
+    max_photos = max(n_photos)
+  )
+]
+
+photo_summary_stats
+photos_per_male
+
+missing_channel_cores <- roi_core_info[has_all_channels == FALSE, roi_core]
+roi_cores_to_process <- roi_core_info[has_all_channels == TRUE, roi_core]
+
+if (length(missing_channel_cores) > 0) {
+  cat("Skipping ROI cores with incomplete channel sets:", length(missing_channel_cores), "\n")
+}
+
+cat("ROI cores selected for processing:", length(roi_cores_to_process), "\n")
+```
+
+
+## Pixel-Level Processing and Feature Extraction
+
+For each complete region of interest, channel-specific pixel files are merged by X/Y coordinate. Low-signal pixels and extreme channel outliers are filtered before opponent-channel metrics are calculated. The workflow then summarizes full-region color values and extracts localized peak-red and peak-blue subsets using quantile thresholds.
+
+```{r pixel-level-processing}
+if (length(roi_cores_to_process) == 0) {
+  stop("No complete ROI cores available for processing.")
+}
+
+file_info_new <- file_info[roi_core %in% roi_cores_to_process]
+
+dir.create(here("output", "rawpixels"), recursive = TRUE, showWarnings = FALSE)
+
+raw_rump_path     <- here("output", "rawpixels", "rawpixelvalues_rump.csv")
+raw_peakred_path  <- here("output", "rawpixels", "rawpixelvalues_rump_peakred.csv")
+raw_peakblue_path <- here("output", "rawpixels", "rawpixelvalues_rump_peakblue.csv")
+
+suppressWarnings(file.remove(raw_rump_path, raw_peakred_path, raw_peakblue_path))
+
+roi_results <- list()
+
+first_rump <- TRUE
+first_peakred <- TRUE
+first_peakblue <- TRUE
+
+aggregate_roi <- function(dt_in) {
+  dt_in[
+    ,
+    .(
+      l = mean(l, na.rm = TRUE),
+      m = mean(m, na.rm = TRUE),
+      s = mean(s, na.rm = TRUE),
+      rg = mean(rg, na.rm = TRUE),
+      by = mean(by, na.rm = TRUE),
+      n_px = .N
+    ),
+    by = .(id, name, period, date, region, roi_core)
+  ]
+}
+
+for (rc in roi_cores_to_process) {
+
+  cat("Processing:", rc, "\n")
+
+  fi <- file_info_new[roi_core == rc]
+
+
+  # Read channel-specific pixel files and merge them into one table.
+  dt_chan <- rbindlist(
+    lapply(seq_len(nrow(fi)), function(i) {
+      x <- fread(fi$file[i], select = c(1, 2, 3), showProgress = FALSE)
+      setnames(x, c("X", "Y", "Value"))
+      setnames(x, "Value", fi$chan[i])
+      x
+    }),
+    use.names = TRUE,
+    fill = TRUE
+  )
+
+  # Ensure all expected channel columns exist.
+  for (cc in c("l", "m", "s")) {
+    if (!cc %in% names(dt_chan)) dt_chan[, (cc) := NA_real_]
+    dt_chan[[cc]] <- data.table::nafill(dt_chan[[cc]], type = "const", fill = 0)
+  }
+
+  # Collapse channel rows into one LMS value per pixel coordinate.
+  dt_pix <- dt_chan[
+    ,
+    .(
+      l = sum(l, na.rm = TRUE),
+      m = sum(m, na.rm = TRUE),
+      s = sum(s, na.rm = TRUE)
+    ),
+    by = .(X, Y)
+  ]
+
+  rm(dt_chan)
+  gc()
+
+  # Remove low-signal pixels.
+  dt_pix <- dt_pix[l >= 0.0084 & m >= 0.0084 & s >= 0.0084]
+
+  if (nrow(dt_pix) == 0) {
+    cat("All candidate pixels removed for:", rc, "\n")
+    next
+  }
+
+  # Attach metadata back to the pixel-level table.
+  meta <- roi_core_info[roi_core == rc][1]
+
+  dt_pix[
+    ,
+    `:=`(
+      roi_core = rc,
+      name = meta$name,
+      date = meta$date,
+      period = meta$period,
+      region = meta$region,
+      photo_id = meta$photo_id,
+      id = meta$id_main
+    )
+  ]
+
+  # Calculate simple opponent-channel color features.
+  dt_pix[, rg := (l - m) / (l + m)]
+  dt_pix[, by := s - ((l + m) / 2)]
+
+  # Remove extreme channel outliers based on proportional LMS values.
+  dt_pix[, total_lms := l + m + s]
+
+  dt_pix[
+    ,
+    `:=`(
+      l_prop = l / total_lms,
+      m_prop = m / total_lms,
+      s_prop = s / total_lms
+    )
+  ]
+
+  q_m_high <- quantile(dt_pix$m_prop, 0.995, na.rm = TRUE)
+  q_l_low  <- quantile(dt_pix$l_prop, 0.01,  na.rm = TRUE)
+  q_s_low  <- quantile(dt_pix$s_prop, 0.005, na.rm = TRUE)
+
+  dt_pix <- dt_pix[
+    !(
+      m_prop >= q_m_high &
+        (l_prop <= q_l_low | s_prop <= q_s_low)
+    )
+  ]
+
+  dt_pix[
+    ,
+    c("total_lms", "l_prop", "m_prop", "s_prop") := NULL
+  ]
+
+  if (nrow(dt_pix) == 0) next
+
+  # Store full-region ROI summary.
+  roi_results[[length(roi_results) + 1]] <- aggregate_roi(dt_pix)
+
+  # For full-region samples, also extract localized peak-color subsets.
+  if (meta$region == "rump") {
+
+    fwrite(
+      dt_pix[, .(id, name, date, region, X, Y, l, m, s)],
+      raw_rump_path,
+      append = !first_rump,
+      col.names = first_rump
+    )
+
+    first_rump <- FALSE
+
+    # Peak-red subset: upper 20% of red-green opponency values.
+    q_rg_high <- quantile(dt_pix$rg, 0.80, na.rm = TRUE)
+
+    dt_peakred <- dt_pix[rg >= q_rg_high]
+    dt_peakred[, region := "rump_peakred"]
+    dt_peakred[, id := make_roi_id(name, date, "rump_peakred")]
+
+    roi_results[[length(roi_results) + 1]] <- aggregate_roi(dt_peakred)
+
+    fwrite(
+      dt_peakred[, .(id, name, date, region, X, Y, l, m, s)],
+      raw_peakred_path,
+      append = !first_peakred,
+      col.names = first_peakred
+    )
+
+    first_peakred <- FALSE
+
+    # Peak-blue subset: upper 20% of blue-yellow opponency values.
+    q_by_high <- quantile(dt_pix$by, 0.80, na.rm = TRUE)
+
+    dt_peakblue <- dt_pix[by >= q_by_high]
+    dt_peakblue[, region := "rump_peakblue"]
+    dt_peakblue[, id := make_roi_id(name, date, "rump_peakblue")]
+
+    roi_results[[length(roi_results) + 1]] <- aggregate_roi(dt_peakblue)
+
+    fwrite(
+      dt_peakblue[, .(id, name, date, region, X, Y, l, m, s)],
+      raw_peakblue_path,
+      append = !first_peakblue,
+      col.names = first_peakblue
+    )
+
+    first_peakblue <- FALSE
+
+    rm(dt_peakred, dt_peakblue)
+  }
+
+  gc()
+}
+
+dt_roi_peak <- rbindlist(
+  roi_results,
+  use.names = TRUE,
+  fill = TRUE
+)
+
+df_color_peak <- as_tibble(dt_roi_peak)
+
+df_color_peak %>%
+  count(region)
+
+fwrite(dt_roi_peak, out_path)
+
+cat("Saved ROI-level dataset:", out_path, "\n")
+```
+
+
+# Data Visualizations
+## Opponent-Channel Distributions
+
+The processed ROI-level dataset includes derived opponent-channel metrics representing red-green (RG) and blue-yellow (BY) chromatic variation.
+
+```{r opponent-channel-distributions, fig.width=8, fig.height=4}
+p_rg <- df_color_peak %>%
+  ggplot(aes(rg)) +
+  geom_histogram(
+    bins = 30,
+    fill = "#B22222",
+    color = "white"
+  ) +
+  labs(
+    title = "Distribution of Red-Green Opponency Values",
+    x = "RG Opponency",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+p_by <- df_color_peak %>%
+  ggplot(aes(by)) +
+  geom_histogram(
+    bins = 30,
+    fill = "#0072B2",
+    color = "white"
+  ) +
+  labs(
+    title = "Distribution of Blue-Yellow Opponency Values",
+    x = "BY Opponency",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+p_rg + p_by
+```
+
+
+## Region-Level Comparisons
+
+Peak-red and peak-blue subsets are expected to differ in their opponent-channel characteristics relative to full-region summaries.
+
+```{r region-comparison-boxplots, fig.width=8, fig.height=4}
+p_region_rg <- df_color_peak %>%
+  ggplot(aes(region, rg, fill = region)) +
+  geom_boxplot(show.legend = FALSE) +
+  scale_fill_manual(
+    values = c(
+      "rump" = "grey70",
+      "rump_peakred" = "#B22222",
+      "rump_peakblue" = "#F28E8C"
+    )
+  ) +
+  labs(
+    title = "RG Opponency Across ROI Types",
+    x = "Region",
+    y = "RG Opponency"
+  ) +
+  theme_minimal()
+
+p_region_by <- df_color_peak %>%
+  ggplot(aes(region, by, fill = region)) +
+  geom_boxplot(show.legend = FALSE) +
+  scale_fill_manual(
+    values = c(
+      "rump" = "grey70",
+      "rump_peakred" = "#56B4E9",
+      "rump_peakblue" = "#0072B2"
+    )
+  ) +
+  labs(
+    title = "BY Opponency Across ROI Types",
+    x = "Region",
+    y = "BY Opponency"
+  ) +
+  theme_minimal()
+
+p_region_rg + p_region_by
+```
+
+
+## Example Pixel-Level Heatmap
+
+The figure below shows an example spatial distribution of red-green opponency values across pixel coordinates from one processed region of interest.
+
+```{r pixel-heatmap, fig.width=6, fig.height=5}
+example_pixels <- fread(raw_rump_path)
+
+example_pixels[, rg := (l - m) / (l + m)]
+
+example_pixels <- example_pixels[
+  id == unique(example_pixels$id)[1]
+]
+
+ggplot(example_pixels, aes(X, Y, fill = rg)) +
+  geom_raster() +
+  scale_fill_gradient(
+    low = "white",
+    high = "#B22222"
+  ) +
+  scale_y_reverse() +
+  coord_fixed() +
+  labs(
+    title = "Example Spatial Distribution of RG Opponency",
+    fill = "RG"
+  ) +
+  theme_minimal()
+```

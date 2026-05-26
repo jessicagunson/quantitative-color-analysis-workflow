@@ -1,0 +1,217 @@
+---
+title: "Longitudinal Behavioral Modeling with GLMMs in R"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+# Overview
+
+This repository demonstrates a reproducible workflow for analyzing longitudinal behavioral data using generalized linear mixed models (GLMMs) in R. The project integrates simulated behavioral and quantitative color datasets to illustrate approaches for repeated-measures modeling, feature engineering, exploratory visualization, model diagnostics, and effect visualization.
+
+The workflow emphasizes reproducible statistical practices, including:
+- structured project organization,
+- longitudinal data wrangling,
+- mixed-effects modeling,
+- model validation,
+- and publication-style visualization.
+
+Although inspired by behavioral ecology research, the analytical framework demonstrated here is broadly applicable to longitudinal and hierarchical data analysis problems across quantitative research domains.
+
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+set.seed(123)
+```
+
+
+## Packages
+
+```{r packages}
+if (!require("pacman")) install.packages("pacman")
+
+pacman::p_load(
+  tidyverse,
+  glmmTMB,
+  DHARMa,
+  ggeffects,
+  patchwork,
+  here
+)
+```
+
+
+## Load Data
+
+Behavioral and quantitative color datasets are loaded and merged by individual identity and sampling period.
+
+```{r load-data}
+behavior_df <- read_csv(
+  here("data", "behavior_data.csv"),
+  show_col_types = FALSE
+)
+
+color_df <- read_csv(
+  here("output", "color_metrics.csv"),
+  show_col_types = FALSE
+)
+
+glimpse(behavior_df)
+glimpse(color_df)
+```
+
+## Merge and Prepare Data
+
+Predictor variables are standardized prior to modeling, and grouping variables are converted to factors for mixed-effects analysis.
+
+```{r merge-and-prepare-data}
+color_model_df <- color_df %>%
+  filter(region == "rump") %>%
+  transmute(
+    id = name,
+    period = as.character(period),
+    rg,
+    by,
+    l,
+    m,
+    s,
+    n_px
+  )
+
+df_models <- behavior_df %>%
+  mutate(
+    id = as.character(id),
+    period = as.character(period)
+  ) %>%
+  left_join(
+    color_model_df,
+    by = c("id", "period")
+  ) %>%
+  mutate(
+    id = factor(id),
+    group = factor(group),
+    period = factor(period),
+    rank_z = as.numeric(scale(rank_prop)),
+    rg_z = as.numeric(scale(rg)),
+    by_z = as.numeric(scale(by))
+  )
+
+glimpse(df_models)
+```
+
+## Exploratory Visualization
+
+Longitudinal trajectories and variable distributions are visualized prior to statistical modeling.
+
+```{r exploratory-visualization, fig.width=8, fig.height=7}
+p_longitudinal <- df_models %>%
+  ggplot(aes(period, rg, group = id)) +
+  geom_line(
+    linewidth = 0.7,
+    alpha = 0.5,
+    color = "grey60"
+  ) +
+  geom_point(
+    size = 1.3,
+    alpha = 0.7,
+    color = "#B22222"
+  ) +
+  geom_smooth(
+    aes(group = 1),
+    method = "loess",
+    se = FALSE,
+    color = "black",
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Longitudinal Changes in RG Opponency",
+    x = "Sampling Period",
+    y = "RG Opponency"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+
+p_behavior <- df_models %>%
+  ggplot(aes(reproductive_behavior_count)) +
+  geom_histogram(
+    bins = 12,
+    fill = "#B22222",
+    color = "white"
+  ) +
+  labs(
+    title = "Distribution of Reproductive Behavior Counts",
+    x = "Behavior Count",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+p_longitudinal / p_behavior
+```
+
+
+## Generalized Linear Mixed Modeling
+
+Generalized linear mixed models (GLMMs) were used to evaluate relationships between behavioral outcomes and quantitative signaling variables while accounting for repeated observations of individuals across sampling periods.
+
+```{r glmm-model}
+m_behavior <- glmmTMB(
+  reproductive_behavior_count ~
+    rank_z +
+    rg_z +
+    (1 | id),
+  
+  family = nbinom2,
+  data = df_models
+)
+
+summary(m_behavior)
+```
+
+## Model Diagnostics
+
+Simulated residual diagnostics were used to evaluate model fit and dispersion.
+
+```{r model-diagnostics, fig.width=7, fig.height=5}
+sim_behavior <- simulateResiduals(m_behavior)
+
+plot(sim_behavior)
+```
+
+
+## Predicted Effects
+
+Predicted marginal effects were estimated to visualize modeled relationships between signaling variables and behavioral outcomes.
+
+```{r predicted-effects, fig.width=6, fig.height=5}
+pred_rg <- ggpredict(
+  m_behavior,
+  terms = "rg_z"
+)
+
+ggplot(pred_rg, aes(x, predicted)) +
+  geom_line(
+    linewidth = 1,
+    color = "#B22222"
+  ) +
+  geom_ribbon(
+    aes(ymin = conf.low, ymax = conf.high),
+    alpha = 0.2,
+    fill = "#B22222"
+  ) +
+  labs(
+    title = "Predicted Effects of RG Opponency",
+    x = "Standardized RG Opponency",
+    y = "Predicted Behavioral Count"
+  ) +
+  theme_minimal()
+```
