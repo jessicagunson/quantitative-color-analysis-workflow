@@ -1,0 +1,31 @@
+---
+title: "Reproducible GLMM Workflow for Longitudinal Behavioral Data"
+output: html_document
+date: "2026-05-26"
+---
+# Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+set.seed(123)
+```
+
+## Overview
+
+This project demonstrates a reproducible workflow for analyzing longitudinal behavioral and signaling data using generalized linear mixed models (GLMMs) in R. The workflow includes data cleaning, exploratory visualization, model fitting, diagnostics, and effect visualization.
+
+The example analysis evaluates relationships among behavioral outcomes, social rank, and quantitative signaling metrics across repeated observations of individuals through time.
+
+# Packages
+```{r packages}
+if (!require("pacman")) install.packages("pacman")
+
+pacman::p_load(tidyverse, glmmTMB, DHARMa, 
+               ggeffects, patchwork, here
+               )
+```
+
