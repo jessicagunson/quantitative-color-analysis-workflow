@@ -97,9 +97,9 @@ Primary packages used include:
 Recommended execution order:
 
 1. `simulate_color_data.R`
-2. `color-data-wrangling-workflow.Rmd`
-3. `simulate_behavior_data.R`
-4. `longitudinal-behavior-modeling.Rmd`
+2. `color_data_wrangling_workflow.Rmd`
+4. `simulate_behavior_data.R`
+5. `longitudinal_behavior_modeling.Rmd`
 
 ---
 
